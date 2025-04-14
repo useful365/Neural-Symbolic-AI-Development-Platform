@@ -1,0 +1,632 @@
+import numpy as np
+import torch
+import torch.nn as nn
+import networkx as nx
+import matplotlib.pyplot as plt
+from typing import Dict, List, Tuple, Any, Optional, Union, Callable
+import time
+import json
+import os
+from collections import deque
+import multiprocessing as mp
+from qiskit import QuantumCircuit, Aer, execute
+from qiskit.providers.aer.noise import NoiseModel, depolarizing_error
+from sklearn.cluster import KMeans
+
+# 1. NeuralProcessor 类
+class NeuralProcessor:
+    """处理模式识别和持续学习任务的神经网络处理器"""
+    
+    def __init__(self, input_dim: int, hidden_dims: List[int], output_dim: int):
+        self.model = nn.Sequential()
+        layers = [input_dim] + hidden_dims + [output_dim]
+        for i in range(len(layers) - 1):
+            self.model.add_module(f"linear_{i}", nn.Linear(layers[i], layers[i+1]))
+            if i < len(layers) - 2:
+                self.model.add_module(f"relu_{i}", nn.ReLU())
+        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=0.001)
+        self.loss_fn = nn.MSELoss()
+        self.activations = {}
+        self.training_history = []
+        self.frozen_layers = set()
+        self.available_loss_fns = {
+            "mse": nn.MSELoss(),
+            "bce": nn.BCELoss(),
+            "cross_entropy": nn.CrossEntropyLoss(),
+            "huber": nn.HuberLoss()
+        }
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """前向传播，记录激活值"""
+        self.activations = {}
+        handles = []
+        for name, module in self.model.named_modules():
+            if isinstance(module, nn.Linear):
+                handles.append(module.register_forward_hook(
+                    lambda m, inp, out, name=name: self.activations.update({name: out.detach()})
+                ))
+        output = self.model(x)
+        for handle in handles:
+            handle.remove()
+        return output
+    
+    def set_loss_function(self, loss_name: str):
+        """设置损失函数"""
+        if loss_name not in self.available_loss_fns:
+            raise ValueError(f"不支持的损失函数 '{loss_name}'")
+        self.loss_fn = self.available_loss_fns[loss_name]
+        return f"损失函数已设置为 {loss_name}"
+    
+    def freeze_layers(self, layer_indices: List[int]):
+        """冻结指定层"""
+        for idx in layer_indices:
+            layer_name = f"linear_{idx}"
+            if hasattr(self.model, layer_name):
+                for param in getattr(self.model, layer_name).parameters():
+                    param.requires_grad = False
+                self.frozen_layers.add(idx)
+            else:
+                raise ValueError(f"层 {layer_name} 未找到")
+        return f"已冻结层: {sorted(list(self.frozen_layers))}"
+    
+    def unfreeze_layers(self, layer_indices: List[int] = None):
+        """解冻指定层或所有层"""
+        if layer_indices is None:
+            for idx in list(self.frozen_layers):
+                layer_name = f"linear_{idx}"
+                for param in getattr(self.model, layer_name).parameters():
+                    param.requires_grad = True
+            unfrozen = list(self.frozen_layers)
+            self.frozen_layers = set()
+        else:
+            unfrozen = []
+            for idx in layer_indices:
+                if idx in self.frozen_layers:
+                    layer_name = f"linear_{idx}"
+                    for param in getattr(self.model, layer_name).parameters():
+                        param.requires_grad = True
+                    self.frozen_layers.remove(idx)
+                    unfrozen.append(idx)
+        return f"已解冻层: {unfrozen}"
+    
+    def train_step(self, x: torch.Tensor, y: torch.Tensor) -> float:
+        """单步训练"""
+        self.optimizer.zero_grad()
+        pred = self.forward(x)
+        loss = self.loss_fn(pred, y)
+        loss.backward()
+        self.optimizer.step()
+        loss_value = loss.item()
+        self.training_history.append(loss_value)
+        return loss_value
+    
+    def train_batch(self, x_batch: torch.Tensor, y_batch: torch.Tensor, epochs: int = 1) -> List[float]:
+        """批量训练"""
+        epoch_losses = []
+        for epoch in range(epochs):
+            loss = self.train_step(x_batch, y_batch)
+            epoch_losses.append(loss)
+        return epoch_losses
+    
+    def get_embedding(self, x: torch.Tensor) -> torch.Tensor:
+        """获取嵌入表示"""
+        self.forward(x)
+        penultimate_key = list(self.activations.keys())[-2] if len(self.activations) > 1 else list(self.activations.keys())[0]
+        return self.activations[penultimate_key]
+    
+    def save_weights(self, filepath: str):
+        """保存模型权重"""
+        torch.save(self.model.state_dict(), filepath)
+        return f"模型权重已保存至 {filepath}"
+    
+    def load_weights(self, filepath: str):
+        """加载模型权重"""
+        self.model.load_state_dict(torch.load(filepath))
+        self.model.eval()
+        return f"模型权重已从 {filepath} 加载"
+
+# 2. SymbolicEngine 类
+class SymbolicEngine:
+    """管理逻辑推理和基于规则的推理"""
+    
+    def __init__(self):
+        self.knowledge_graph = nx.DiGraph()
+        self.rules = []
+        self.rule_confidence = {}
+        self.fact_confidence = {}
+        self.inference_history = []
+        self.ontology = {}
+    
+    def add_fact(self, subject: str, predicate: str, object_: str, confidence: float = 1.0):
+        """添加事实"""
+        self.knowledge_graph.add_edge(subject, object_, relation=predicate)
+        self.fact_confidence[(subject, predicate, object_)] = confidence
+    
+    def add_rule(self, condition: List[Tuple[str, str, str]], conclusion: Tuple[str, str, str], 
+                 confidence: float = 1.0):
+        """添加推理规则"""
+        rule_id = len(self.rules)
+        self.rules.append((condition, conclusion))
+        self.rule_confidence[rule_id] = confidence
+    
+    def query(self, subject: Optional[str] = None, predicate: Optional[str] = None, 
+              object_: Optional[str] = None) -> List[Tuple[str, str, str]]:
+        """查询知识图谱"""
+        results = []
+        for s, o, data in self.knowledge_graph.edges(data=True):
+            p = data['relation']
+            if (subject and s != subject) or (predicate and p != predicate) or (object_ and o != object_):
+                continue
+            results.append((s, p, o))
+        return results
+    
+    def advanced_query(self, subject: Optional[str] = None, predicate: Optional[str] = None, 
+                       object_: Optional[str] = None, min_confidence: float = 0.0) -> List[Dict]:
+        """高级查询，支持置信度过滤"""
+        basic_results = self.query(subject, predicate, object_)
+        advanced_results = []
+        for s, p, o in basic_results:
+            confidence = self.fact_confidence.get((s, p, o), 0.0)
+            if confidence >= min_confidence:
+                advanced_results.append({
+                    "subject": s,
+                    "predicate": p,
+                    "object": o,
+                    "confidence": confidence
+                })
+        return advanced_results
+    
+    def apply_rules(self, confidence_threshold: float = 0.5) -> int:
+        """应用推理规则"""
+        original_fact_count = self.knowledge_graph.number_of_edges()
+        new_facts_added = 0
+        for rule_idx, (conditions, conclusion) in enumerate(self.rules):
+            rule_conf = self.rule_confidence.get(rule_idx, 1.0)
+            if rule_conf < confidence_threshold:
+                continue
+            all_conditions_met = True
+            condition_confidences = []
+            for subj, pred, obj in conditions:
+                matching_facts = self.query(subject=subj, predicate=pred, object_=obj)
+                if not matching_facts:
+                    all_conditions_met = False
+                    break
+                for s, p, o in matching_facts:
+                    confidence = self.fact_confidence.get((s, p, o), 0.0)
+                    condition_confidences.append(confidence)
+            if all_conditions_met:
+                subj, pred, obj = conclusion
+                conclusion_confidence = min(rule_conf, min(condition_confidences))
+                existing_confidence = self.fact_confidence.get((subj, pred, obj), 0.0)
+                if conclusion_confidence > existing_confidence:
+                    self.add_fact(subj, pred, obj, conclusion_confidence)
+                    self.inference_history.append({
+                        "rule_idx": rule_idx,
+                        "conditions": conditions,
+                        "conclusion": conclusion,
+                        "confidence": conclusion_confidence,
+                        "timestamp": time.time()
+                    })
+                    new_facts_added += 1
+        return new_facts_added
+    
+    def define_ontology_relation(self, relation_type: str, parent: str, child: str):
+        """定义本体关系"""
+        if relation_type not in self.ontology:
+            self.ontology[relation_type] = nx.DiGraph()
+        self.ontology[relation_type].add_edge(parent, child)
+    
+    def query_ontology(self, relation_type: str, parent: Optional[str] = None, 
+                       find_all_children: bool = False) -> List[str]:
+        """查询本体关系"""
+        if relation_type not in self.ontology:
+            return []
+        if parent is None:
+            return list(self.ontology[relation_type].nodes())
+        if find_all_children:
+            try:
+                descendants = nx.descendants(self.ontology[relation_type], parent)
+                return list(descendants)
+            except nx.NetworkXError:
+                return []
+        else:
+            try:
+                children = list(self.ontology[relation_type].successors(parent))
+                return children
+            except nx.NetworkXError:
+                return []
+    
+    def visualize_graph(self):
+        """可视化知识图谱"""
+        plt.figure(figsize=(10, 8))
+        pos = nx.spring_layout(self.knowledge_graph)
+        nx.draw(self.knowledge_graph, pos, with_labels=True, 
+                node_color='lightblue', node_size=1500, font_size=10)
+        edge_labels = {(s, o): d['relation'] for s, o, d in self.knowledge_graph.edges(data=True)}
+        nx.draw_networkx_edge_labels(self.knowledge_graph, pos, edge_labels=edge_labels)
+        plt.title("知识图谱可视化")
+        plt.axis('off')
+        return plt.gcf()
+    
+    def export_knowledge(self, format_type: str = "json") -> str:
+        """导出知识数据"""
+        if format_type == "json":
+            knowledge_data = {
+                "facts": [],
+                "rules": [],
+                "ontology": {}
+            }
+            for s, o, data in self.knowledge_graph.edges(data=True):
+                p = data['relation']
+                confidence = self.fact_confidence.get((s, p, o), 1.0)
+                knowledge_data["facts"].append({
+                    "subject": s,
+                    "predicate": p,
+                    "object": o,
+                    "confidence": confidence
+                })
+            for rule_idx, (conditions, conclusion) in enumerate(self.rules):
+                confidence = self.rule_confidence.get(rule_idx, 1.0)
+                knowledge_data["rules"].append({
+                    "conditions": [{"subject": s, "predicate": p, "object": o} 
+                                   for s, p, o in conditions],
+                    "conclusion": {
+                        "subject": conclusion[0],
+                        "predicate": conclusion[1],
+                        "object": conclusion[2]
+                    },
+                    "confidence": confidence
+                })
+            for relation_type, graph in self.ontology.items():
+                knowledge_data["ontology"][relation_type] = [
+                    {"parent": s, "child": t} for s, t in graph.edges()
+                ]
+            return json.dumps(knowledge_data, indent=2)
+        else:
+            raise ValueError(f"不支持的导出格式: {format_type}")
+
+# 3. KnowledgeFusionUnit 类
+class KnowledgeFusionUnit:
+    """在神经嵌入和符号图之间进行转换"""
+    
+    def __init__(self, embedding_dim: int, symbolic_engine: SymbolicEngine):
+        self.embedding_dim = embedding_dim
+        self.symbolic_engine = symbolic_engine
+        self.entity_embeddings = {}
+        self.relation_embeddings = {}
+        self.entity_clusters = {}
+        self.relation_clusters = {}
+        self.distance_metrics = {
+            "cosine": lambda x, y: 1.0 - torch.nn.functional.cosine_similarity(x.view(1, -1), y.view(1, -1)).item(),
+            "euclidean": lambda x, y: torch.norm(x - y).item(),
+            "manhattan": lambda x, y: torch.sum(torch.abs(x - y)).item()
+        }
+        self.active_distance_metric = "cosine"
+        self.error_log = []
+        self.error_threshold = 0.5
+    
+    def register_entity_embedding(self, entity_name: str, embedding: torch.Tensor):
+        """注册实体嵌入"""
+        self.entity_embeddings[entity_name] = embedding
+    
+    def register_relation_embedding(self, relation_name: str, embedding: torch.Tensor):
+        """注册关系嵌入"""
+        self.relation_embeddings[relation_name] = embedding
+    
+    def set_distance_metric(self, metric_name: str):
+        """设置距离度量方法"""
+        if metric_name not in self.distance_metrics:
+            raise ValueError(f"未知的距离度量: {metric_name}")
+        self.active_distance_metric = metric_name
+        return f"距离度量已设置为 {metric_name}"
+    
+    def _calculate_distance(self, emb1: torch.Tensor, emb2: torch.Tensor) -> float:
+        """计算两个嵌入之间的距离"""
+        return self.distance_metrics[self.active_distance_metric](emb1, emb2)
+    
+    def find_closest_entity(self, embedding: torch.Tensor) -> Tuple[str, float]:
+        """找到最接近的实体"""
+        closest_entity = None
+        closest_distance = float('inf')
+        for entity, entity_emb in self.entity_embeddings.items():
+            distance = self._calculate_distance(embedding, entity_emb)
+            if distance < closest_distance:
+                closest_distance = distance
+                closest_entity = entity
+        return closest_entity, closest_distance
+    
+    def find_closest_relation(self, embedding: torch.Tensor) -> Tuple[str, float]:
+        """找到最接近的关系"""
+        closest_relation = None
+        closest_distance = float('inf')
+        for relation, relation_emb in self.relation_embeddings.items():
+            distance = self._calculate_distance(embedding, relation_emb)
+            if distance < closest_distance:
+                closest_distance = distance
+                closest_relation = relation
+        return closest_relation, closest_distance
+    
+    def neural_to_symbolic(self, subject_emb: torch.Tensor, relation_emb: torch.Tensor, 
+                           object_emb: torch.Tensor, threshold: float = 0.3) -> Optional[Tuple[str, str, str]]:
+        """从神经嵌入转换为符号三元组"""
+        subject, subj_distance = self.find_closest_entity(subject_emb)
+        relation, rel_distance = self.find_closest_relation(relation_emb)
+        object_, obj_distance = self.find_closest_entity(object_emb)
+        avg_distance = (subj_distance + rel_distance + obj_distance) / 3
+        if avg_distance < threshold:
+            self.log_conversion_error((subject, relation, object_), avg_distance, "successful_conversion")
+            return subject, relation, object_
+        else:
+            self.log_conversion_error((subject, relation, object_), avg_distance, "failed_conversion")
+            return None
+    
+    def symbolic_to_neural(self, triplet: Tuple[str, str, str]) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """从符号三元组转换为神经嵌入"""
+        subject, relation, object_ = triplet
+        subject_emb = self.entity_embeddings.get(subject, torch.zeros(self.embedding_dim))
+        relation_emb = self.relation_embeddings.get(relation, torch.zeros(self.embedding_dim))
+        object_emb = self.entity_embeddings.get(object_, torch.zeros(self.embedding_dim))
+        return subject_emb, relation_emb, object_emb
+    
+    def generate_entity_embeddings(self, neural_processor: NeuralProcessor, use_random: bool = False):
+        """生成实体嵌入"""
+        entities = set()
+        for s, o, _ in self.symbolic_engine.knowledge_graph.edges(data=True):
+            entities.add(s)
+            entities.add(o)
+        for entity in entities:
+            if use_random:
+                emb = torch.randn(self.embedding_dim)
+            else:
+                name_tensor = torch.zeros(64)
+                for i, c in enumerate(entity[:min(len(entity), 64)]):
+                    name_tensor[i] = ord(c) / 255.0
+                with torch.no_grad():
+                    name_tensor = name_tensor.unsqueeze(0)
+                    emb = neural_processor.get_embedding(name_tensor).squeeze()
+            self.register_entity_embedding(entity, emb)
+        return f"已为 {len(entities)} 个实体生成嵌入"
+    
+    def cluster_embeddings(self, n_clusters: int = 5):
+        """对嵌入进行聚类"""
+        if len(self.entity_embeddings) >= n_clusters:
+            entity_matrix = torch.stack(list(self.entity_embeddings.values()))
+            entity_names = list(self.entity_embeddings.keys())
+            kmeans = KMeans(n_clusters=min(n_clusters, len(entity_names)))
+            clusters = kmeans.fit_predict(entity_matrix.numpy())
+            self.entity_clusters = {i: [] for i in range(n_clusters)}
+            for i, cluster_id in enumerate(clusters):
+                self.entity_clusters[cluster_id].append(entity_names[i])
+        if len(self.relation_embeddings) >= 2:
+            relation_matrix = torch.stack(list(self.relation_embeddings.values()))
+            relation_names = list(self.relation_embeddings.keys())
+            rel_n_clusters = min(n_clusters, len(relation_names))
+            if rel_n_clusters > 1:
+                kmeans = KMeans(n_clusters=rel_n_clusters)
+                clusters = kmeans.fit_predict(relation_matrix.numpy())
+                self.relation_clusters = {i: [] for i in range(rel_n_clusters)}
+                for i, cluster_id in enumerate(clusters):
+                    self.relation_clusters[cluster_id].append(relation_names[i])
+        return {
+            "entity_clusters": self.entity_clusters,
+            "relation_clusters": self.relation_clusters
+        }
+    
+    def log_conversion_error(self, triplet: Tuple[str, str, str], distance: float, context: str):
+        """记录转换错误"""
+        error_entry = {
+            "triplet": triplet,
+            "distance": distance,
+            "context": context,
+            "timestamp": time.time()
+        }
+        self.error_log.append(error_entry)
+        return error_entry
+    
+    def get_error_summary(self) -> Dict[str, Any]:
+        """获取错误摘要"""
+        if not self.error_log:
+            return {"total_errors": 0, "avg_distance": 0.0, "failed_conversions": 0}
+        total_errors = len(self.error_log)
+        failed_conversions = sum(1 for e in self.error_log if e["context"] == "failed_conversion")
+        avg_distance = np.mean([e["distance"] for e in self.error_log])
+        return {
+            "total_errors": total_errors,
+            "avg_distance": avg_distance,
+            "failed_conversions": failed_conversions,
+            "recent_errors": self.error_log[-5:]
+        }
+
+# 4. QuantumTask 类
+class QuantumTask:
+    """定义支持噪声模拟和可视化的量子任务"""
+    
+    def __init__(self, circuit: QuantumCircuit, shots: int = 1024, backend: str = "qasm_simulator",
+                 noise_model: Optional[NoiseModel] = None):
+        self.circuit = circuit
+        self.shots = shots
+        self.backend = backend
+        self.noise_model = noise_model or self._default_noise_model()
+        self.result = None
+    
+    def _default_noise_model(self) -> NoiseModel:
+        """创建默认噪声模型"""
+        noise_model = NoiseModel()
+        error_1q = depolarizing_error(0.005, 1)
+        noise_model.add_all_qubit_quantum_error(error_1q, ['u1', 'u2', 'u3'])
+        error_2q = depolarizing_error(0.02, 2)
+        noise_model.add_all_qubit_quantum_error(error_2q, ['cx'])
+        return noise_model
+    
+    def execute(self) -> Dict[str, float]:
+        """执行量子任务"""
+        backend = Aer.get_backend(self.backend)
+        job = execute(self.circuit, backend, shots=self.shots, noise_model=self.noise_model)
+        result = job.result()
+        counts = result.get_counts()
+        probabilities = {state: count / self.shots for state, count in counts.items()}
+        self.result = probabilities
+        return probabilities
+    
+    def visualize(self, output_path: str = None) -> plt.Figure:
+        """可视化量子电路"""
+        fig = plt.figure(figsize=(8, 6))
+        self.circuit.draw(output='mpl', filename=output_path)
+        plt.title("量子电路")
+        if output_path:
+            plt.savefig(output_path)
+        return fig
+
+# 5. ExecutionScheduler 类
+class ExecutionScheduler:
+    """调度和执行任务，支持依赖管理和分布式执行"""
+    
+    def __init__(self, neural_processor: NeuralProcessor, symbolic_engine: SymbolicEngine,
+                 fusion_unit: KnowledgeFusionUnit, num_workers: int = mp.cpu_count()):
+        self.neural_processor = neural_processor
+        self.symbolic_engine = symbolic_engine
+        self.fusion_unit = fusion_unit
+        self.task_queue = []
+        self.dependency_graph = nx.DiGraph()
+        self.task_results = {}
+        self.num_workers = num_workers
+        self.pool = mp.Pool(processes=num_workers)
+        self.performance_history = deque(maxlen=100)
+        self.task_weights = {"neural": 1.0, "symbolic": 1.0, "quantum": 1.0}
+    
+    def queue_task(self, task_data: Any, task_type: str = "auto", priority: float = 0.5,
+                   dependencies: List[str] = None) -> str:
+        """将任务加入队列"""
+        task_id = f"task_{len(self.task_queue) + 1}_{int(time.time())}"
+        self.task_queue.append((priority, task_id, task_data, task_type))
+        self.dependency_graph.add_node(task_id)
+        if dependencies:
+            for dep_id in dependencies:
+                if dep_id not in self.dependency_graph:
+                    raise ValueError(f"依赖 {dep_id} 未找到")
+                self.dependency_graph.add_edge(dep_id, task_id)
+        self.task_queue.sort(reverse=True)
+        return task_id
+    
+    def process_next_task(self) -> Optional[Dict[str, Any]]:
+        """处理下一个任务"""
+        if not self.task_queue:
+            return None
+        for i, (priority, task_id, task_data, task_type) in enumerate(self.task_queue):
+            if all(dep in self.task_results for dep in self.dependency_graph.predecessors(task_id)):
+                self.task_queue.pop(i)
+                break
+        else:
+            raise RuntimeError("未找到无未解决依赖的任务")
+        dep_outputs = {dep: self.task_results[dep] for dep in self.dependency_graph.predecessors(task_id)}
+        if dep_outputs:
+            task_data["dependencies"] = dep_outputs
+        result = self.process_task(task_data, task_type)
+        self.task_results[task_id] = result
+        result["task_id"] = task_id
+        return result
+    
+    def process_task(self, task_data: Any, task_type: str = "auto") -> Dict[str, Any]:
+        """处理单个任务"""
+        if task_type == "quantum":
+            result = self._execute_quantum_task(task_data)
+        else:
+            result = self.pool.apply(self._execute_classical_task, args=(task_data, task_type))
+        self.performance_history.append({
+            "type": task_type,
+            "execution_time": result["execution_time"],
+            "timestamp": time.time()
+        })
+        self.update_task_weights()
+        return result
+    
+    def _execute_quantum_task(self, task_data: QuantumTask) -> Dict[str, Any]:
+        """执行量子任务"""
+        start_time = time.time()
+        probabilities = task_data.execute()
+        execution_time = time.time() - start_time
+        return {
+            "result": {"quantum_result": probabilities},
+            "execution_time": execution_time,
+            "task_type": "quantum"
+        }
+    
+    def _execute_classical_task(self, task_data: Dict[str, Any], task_type: str) -> Dict[str, Any]:
+        """执行经典任务"""
+        start_time = time.time()
+        if task_type == "neural":
+            input_tensor = task_data.get("input", torch.randn(1, self.neural_processor.model[0].in_features))
+            output = self.neural_processor.forward(input_tensor)
+            task_result = {"neural_output": output.detach().numpy()}
+        else:
+            query_result = self.symbolic_engine.query(**task_data.get("query", {}))
+            task_result = {"symbolic_result": query_result}
+        execution_time = time.time() - start_time
+        return {
+            "result": task_result,
+            "execution_time": execution_time,
+            "task_type": task_type
+        }
+    
+    def process_all_tasks(self) -> List[Dict[str, Any]]:
+        """处理所有任务"""
+        results = []
+        while self.task_queue:
+            try:
+                result = self.process_next_task()
+                if result:
+                    results.append(result)
+            except RuntimeError:
+                break
+        return results
+    
+    def update_task_weights(self):
+        """更新任务权重以优化调度"""
+        if not self.performance_history:
+            return
+        type_times = {"neural": [], "symbolic": [], "quantum": []}
+        for entry in self.performance_history:
+            type_times[entry["type"]].append(entry["execution_time"])
+        avg_times = {t: np.mean(times) if times else 1.0 for t, times in type_times.items()}
+        total_time = sum(avg_times.values())
+        for t in self.task_weights:
+            self.task_weights[t] = total_time / (avg_times[t] + 1e-6)
+        total_weight = sum(self.task_weights.values())
+        for t in self.task_weights:
+            self.task_weights[t] /= total_weight
+    
+    def __del__(self):
+        """清理资源"""
+        self.pool.close()
+        self.pool.join()
+
+# 示例用法
+if __name__ == "__main__":
+    # 初始化组件
+    neural_processor = NeuralProcessor(input_dim=64, hidden_dims=[128, 64], output_dim=32)
+    symbolic_engine = SymbolicEngine()
+    fusion_unit = KnowledgeFusionUnit(embedding_dim=32, symbolic_engine=symbolic_engine)
+    scheduler = ExecutionScheduler(neural_processor, symbolic_engine, fusion_unit)
+
+    # 示例1：插入并执行量子任务
+    qc = QuantumCircuit(2, 2)
+    qc.h(0)
+    qc.cx(0, 1)
+    qc.measure([0, 1], [0, 1])
+    quantum_task_id = scheduler.queue_task(QuantumTask(qc), task_type="quantum", priority=0.8)
+    result = scheduler.process_next_task()
+    print(f"量子任务结果: {result}")
+
+    # 示例2：检查错误追踪
+    subject_emb = torch.randn(32)
+    relation_emb = torch.randn(32)
+    object_emb = torch.randn(32)
+    fusion_unit.neural_to_symbolic(subject_emb, relation_emb, object_emb)
+    print(f"错误摘要: {fusion_unit.get_error_summary()}")
+
+    # 示例3：自适应优化器效果
+    for _ in range(5):
+        scheduler.queue_task({"input": torch.randn(1, 64)}, task_type="neural", priority=0.5)
+        scheduler.queue_task({"query": {"subject": "test"}}, task_type="symbolic", priority=0.5)
+        results = scheduler.process_all_tasks()
+        print(f"任务权重: {scheduler.task_weights}")
